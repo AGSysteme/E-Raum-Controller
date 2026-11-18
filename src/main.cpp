@@ -2,6 +2,7 @@
 #include <ETH.h>
 #include <SD_MMC.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -27,6 +28,7 @@
 
 WiFiClient netClient;
 PubSubClient mqtt(netClient);
+WebServer httpServer(80);
 
 static String topicCmd;
 static String topicStop;
@@ -506,6 +508,7 @@ void setup() {
     }
     Serial.println();
     logLine(String("IP: ") + ETH.localIP().toString());
+    setupHttp();
 
     String base = String("ela/") + ELA_DEVICE_ID;
     topicCmd = base + "/cmd";
@@ -520,11 +523,34 @@ void setup() {
     logLine("Start, Audio-Ausgang: " AUDIO_BACKEND_NAME);
 }
 
+// ---------- HTTP: Logdatei abrufbar machen (nur im LAN, keine Authentifizierung) ----------
+
+static void sendFile(const char *path) {
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) {
+        httpServer.send(404, "text/plain", String("nicht vorhanden: ") + path);
+        return;
+    }
+    httpServer.streamFile(f, "text/plain; charset=utf-8");
+    f.close();
+}
+
+static void setupHttp() {
+    httpServer.on("/log", []() { sendFile(LOG_FILE); });
+    httpServer.on("/log/old", []() { sendFile(LOG_OLD_FILE); });
+    httpServer.on("/", []() {
+        httpServer.send(200, "text/plain", String("E-Raum-Controller ") + ELA_DEVICE_ID + "\n/log\n/log/old\n");
+    });
+    httpServer.begin();
+    logLine("HTTP: /log und /log/old auf Port 80");
+}
+
 void loop() {
     if (!mqtt.connected()) {
         mqttConnect();
     }
     mqtt.loop();
+    httpServer.handleClient();
 
     AckMsg ack;
     while (xQueueReceive(ackQueue, &ack, 0) == pdTRUE) {
