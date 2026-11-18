@@ -23,7 +23,7 @@
 // Ansage weiterläuft und ein "stop" sofort wirkt.
 // ---------------------------------------------------------------
 
-static const char *SD_ROOT = SD_MOUNT_POINT;
+// SD_MMC-Pfade sind relativ zur Kartenwurzel (den Mountpoint setzt die Bibliothek selbst)
 
 WiFiClient netClient;
 PubSubClient mqtt(netClient);
@@ -103,9 +103,9 @@ static bool downloadFile(const char *url, const char *path) {
     }
 
     // Temporärer Name im 8.3-Format (FAT ohne lange Namen): /sd/AUDIO/DL.TMP
-    String tmp = String(SD_ROOT) + AUDIO_DIR + "/DL.TMP";
-    if (!SD_MMC.exists((String(SD_ROOT) + AUDIO_DIR).c_str())) {
-        SD_MMC.mkdir((String(SD_ROOT) + AUDIO_DIR).c_str());
+    String tmp = String(AUDIO_DIR) + "/DL.TMP";
+    if (!SD_MMC.exists(AUDIO_DIR)) {
+        SD_MMC.mkdir(AUDIO_DIR);
     }
     SD_MMC.remove(tmp.c_str());
     File out = SD_MMC.open(tmp.c_str(), FILE_WRITE);
@@ -224,7 +224,7 @@ static void playTask(void *param) {
     PlayJob *job = (PlayJob *)param;
 
     char path[64];
-    snprintf(path, sizeof(path), "%s%s/%04u.WAV", SD_ROOT, AUDIO_DIR, (unsigned)job->audio);
+    snprintf(path, sizeof(path), "%s/%04u.WAV", AUDIO_DIR, (unsigned)job->audio);
 
     if (!SD_MMC.exists(path)) {
         if (job->url[0] == '\0' || !downloadFile(job->url, path)) {
@@ -369,7 +369,7 @@ void setup() {
         Serial.println("FEHLER: SD-Karte nicht erkannt");
     } else {
         Serial.printf("SD eingebunden, %llu MB\n", SD_MMC.totalBytes() / (1024ULL * 1024ULL));
-        String audioDir = String(SD_ROOT) + AUDIO_DIR;
+        String audioDir = String(AUDIO_DIR);
         if (!SD_MMC.exists(audioDir.c_str())) {
             SD_MMC.mkdir(audioDir.c_str());
         }
