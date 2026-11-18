@@ -102,10 +102,15 @@ static bool downloadFile(const char *url, const char *path) {
         return false;
     }
 
-    String tmp = String(path) + ".tmp";
+    // Temporärer Name im 8.3-Format (FAT ohne lange Namen): /sd/AUDIO/DL.TMP
+    String tmp = String(SD_ROOT) + AUDIO_DIR + "/DL.TMP";
+    if (!SD_MMC.exists((String(SD_ROOT) + AUDIO_DIR).c_str())) {
+        SD_MMC.mkdir((String(SD_ROOT) + AUDIO_DIR).c_str());
+    }
     SD_MMC.remove(tmp.c_str());
     File out = SD_MMC.open(tmp.c_str(), FILE_WRITE);
     if (!out) {
+        Serial.printf("download: konnte %s nicht schreiben\n", tmp.c_str());
         http.end();
         return false;
     }
