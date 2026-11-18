@@ -24,7 +24,10 @@ Quellen:
 |---|---|---|
 | I²S BCK (PCM5102A) | 17 | nicht vom Ethernet belegt |
 | I²S WS (PCM5102A) | 16 | nicht vom Ethernet belegt |
-| I²S DIN (PCM5102A) | 4 | Touch-Pin, als Ausgang nutzbar |
+| I²S DIN (PCM5102A) | 5 | Strapping-Pin (SDIO-Timing), als Ausgang nach dem Booten unkritisch |
+| PWM-Test-Audio | 4 | Test ohne PCM5102A: 8-Bit-PWM, 2,2 kΩ in Reihe, 10 nF nach GND |
+
+Der interne DAC (GPIO 25/26) ist nicht nutzbar: Auf diesem Board sind das die Ethernet-Datenleitungen RXD0/RXD1.
 
 Nicht verwenden:
 - GPIO 3 (U0RXD): Der CH340 kann über GPIO 3 mitversorgt werden, wenn er als Ausgang gesetzt ist (Hinweis aus dem FAQ des Herstellers).
