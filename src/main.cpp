@@ -71,6 +71,20 @@ static void logLine(const String &msg) {
     }
 }
 
+// Zeitangabe für Log und Startseite: Datum und Uhrzeit, wenn NTP gesetzt ist,
+// sonst die Laufzeit seit dem Start.
+static String nowText() {
+    time_t t = time(nullptr);
+    if (t > 1700000000) {
+        struct tm tmInfo;
+        localtime_r(&t, &tmInfo);
+        char buf[24];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmInfo);
+        return String(buf);
+    }
+    return String("ohne Uhrzeit, Laufzeit ") + String((unsigned long)millis()) + " ms";
+}
+
 static void writeLogLine(const String &msg) {
     File current = SD_MMC.open(LOG_FILE, FILE_READ);
     if (current) {
@@ -84,7 +98,7 @@ static void writeLogLine(const String &msg) {
 
     File log = SD_MMC.open(LOG_FILE, FILE_APPEND);
     if (log) {
-        log.printf("%lu %s\n", millis(), msg.c_str());
+        log.printf("%s %s\n", nowText().c_str(), msg.c_str());
         log.close();
     }
 }
@@ -680,7 +694,8 @@ static void setupHttp() {
     httpServer.on("/log", []() { sendFile(LOG_FILE); });
     httpServer.on("/log/old", []() { sendFile(LOG_OLD_FILE); });
     httpServer.on("/", []() {
-        httpServer.send(200, "text/plain", String("E-Raum-Controller ") + ELA_DEVICE_ID + "\n/log\n/log/old\n");
+        httpServer.send(200, "text/plain", String("E-Raum-Controller ") + ELA_DEVICE_ID
+                        + "\nZeit: " + nowText() + "\n/log\n/log/old\n");
     });
     httpServer.begin();
     logLine("HTTP: /log und /log/old auf Port 80");
