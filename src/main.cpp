@@ -29,6 +29,7 @@
 WiFiClient netClient;
 PubSubClient mqtt(netClient);
 WebServer httpServer(80);
+static void setupHttp();
 
 static String topicCmd;
 static String topicStop;
