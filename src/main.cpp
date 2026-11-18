@@ -241,7 +241,7 @@ static void outputSamplesPwm(const uint8_t *buf, size_t bytes, uint32_t &nextUs)
     for (size_t i = 0; i + 1 < bytes; i += 2) {
         int16_t s = (int16_t)(buf[i] | (buf[i + 1] << 8));
         uint8_t v = (uint8_t)((s + 32768) >> 8);
-        ledcWrite(AUDIO_PWM_CHANNEL, v);
+        ledcWrite(AUDIO_PWM_PIN, v);
         while ((int32_t)(micros() - nextUs) < 0) {
         }
         nextUs += 62;  // 1e6 / 16000 Hz, ergibt ca. 0,8 % Tempoabweichung
@@ -279,7 +279,7 @@ static bool playWav(File &f, uint32_t maxMs) {
     }
 
 #if AUDIO_BACKEND_PWM
-    ledcWrite(AUDIO_PWM_CHANNEL, 128);  // Mittelstellung, kein Knacken am Ende
+    ledcWrite(AUDIO_PWM_PIN, 128);  // Mittelstellung, kein Knacken am Ende
 #endif
     if (!stopRequested) {
         delay(50);
@@ -453,9 +453,9 @@ void setup() {
 
 #if AUDIO_BACKEND_PWM
     // Test-Ausgabe: 8-Bit-PWM auf GPIO 4, Tiefpass (2,2 kΩ + 10 nF) davor
-    ledcSetup(AUDIO_PWM_CHANNEL, AUDIO_PWM_FREQ, 8);
-    ledcAttachPin(AUDIO_PWM_PIN, AUDIO_PWM_CHANNEL);
-    ledcWrite(AUDIO_PWM_CHANNEL, 128);
+    // Arduino-ESP32 3.x: ledcAttach(Pin, Frequenz, Auflösung), ledcWrite über den Pin
+    ledcAttach(AUDIO_PWM_PIN, AUDIO_PWM_FREQ, 8);
+    ledcWrite(AUDIO_PWM_PIN, 128);
 #else
     i2s_config_t i2sConfig = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
