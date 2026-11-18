@@ -14,16 +14,16 @@
 //  - Ethernet (Olimex ESP32-EVB, Standard-Pins des Boards)
 //  - MQTT: Befehle empfangen (cmd, stop), Quittungen senden (ack),
 //          Heartbeat (status, retained, Last-Will offline)
-//  - SD-Karte (1-Bit): Ansagen in /AUDIO/NNNN.WAV, Download per HTTP
-//  - I²S-DAC (PCM5102A): Wiedergabe von 16 Bit mono 16 kHz
+//  - SD-Karte (1-Bit): AUDIO/NNNN.WAV, CONFIG/, LOG/ELA.LOG
+//  - Ansagen per HTTP nachladen, wenn sie fehlen
+//  - Audioausgabe: PWM-Test auf GPIO 4 (AUDIO_BACKEND_PWM) oder I²S (PCM5102A)
 //  - Zwei Relais: Ausgang 1 = Relais 1, Ausgang 2 = Relais 2
 //
-// Protokoll: app/docs/mqtt.md
-// Die Wiedergabe läuft in einer eigenen Task, damit MQTT während der
-// Ansage weiterläuft und ein "stop" sofort wirkt.
+// Protokoll: app/docs/mqtt.md. Struktur der SD-Karte: docs/sd-karte.md.
+// Wiedergabe läuft in einer eigenen Task (Kern 0), damit MQTT (Kern 1)
+// während der Ansage weiterläuft und ein "stop" sofort wirkt.
+// SD_MMC-Pfade sind relativ zur Kartenwurzel (der Mountpoint wird von der Bibliothek gesetzt).
 // ---------------------------------------------------------------
-
-// SD_MMC-Pfade sind relativ zur Kartenwurzel (den Mountpoint setzt die Bibliothek selbst)
 
 WiFiClient netClient;
 PubSubClient mqtt(netClient);
@@ -48,10 +48,47 @@ struct PlayJob {
 };
 
 static QueueHandle_t ackQueue;
+static QueueHandle_t logQueue;
 static volatile bool busy = false;
 static volatile bool stopRequested = false;
 static volatile uint32_t jobDeadline = 0;
 static unsigned long lastStatusMs = 0;
+
+// ---------- Logging: Tasks legen Zeilen in eine Warteschlange, die Hauptschleife schreibt ----------
+
+static void logLine(const String &msg) {
+    Serial.println(msg);
+    String *copy = new String(msg);
+    if (xQueueSend(logQueue, &copy, 0) != pdTRUE) {
+        delete copy;  // Warteschlange voll: Zeile verwerfen
+    }
+}
+
+static void writeLogLine(const String &msg) {
+    File current = SD_MMC.open(LOG_FILE, FILE_READ);
+    if (current) {
+        size_t size = current.size();
+        current.close();
+        if (size > LOG_MAX_BYTES) {
+            SD_MMC.remove(LOG_OLD_FILE);
+            SD_MMC.rename(LOG_FILE, LOG_OLD_FILE);
+        }
+    }
+
+    File log = SD_MMC.open(LOG_FILE, FILE_APPEND);
+    if (log) {
+        log.printf("%lu %s\n", millis(), msg.c_str());
+        log.close();
+    }
+}
+
+static void flushLog() {
+    String *msg;
+    while (xQueueReceive(logQueue, &msg, 0) == pdTRUE) {
+        writeLogLine(*msg);
+        delete msg;
+    }
+}
 
 // ---------- Relais ----------
 
@@ -73,6 +110,12 @@ static void queueAck(uint32_t id, const char *state, const char *detail = "") {
     strlcpy(msg.state, state, sizeof(msg.state));
     strlcpy(msg.detail, detail, sizeof(msg.detail));
     xQueueSend(ackQueue, &msg, 0);
+
+    String line = String("ack ") + String((unsigned long)id) + " " + state;
+    if (detail[0] != '\0') {
+        line += String(" ") + detail;
+    }
+    logLine(line);
 }
 
 static void publishAck(const AckMsg &msg) {
@@ -86,7 +129,6 @@ static void publishAck(const AckMsg &msg) {
     char out[200];
     size_t n = serializeJson(doc, out, sizeof(out));
     mqtt.publish(topicAck.c_str(), out, n);
-    Serial.printf("ack %lu %s %s\n", (unsigned long)msg.id, msg.state, msg.detail);
 }
 
 // ---------- Audio: Download per HTTP ----------
@@ -97,12 +139,12 @@ static bool downloadFile(const char *url, const char *path) {
     int code = http.GET();
 
     if (code != HTTP_CODE_OK) {
-        Serial.printf("download %s: HTTP %d\n", url, code);
+        logLine(String("download ") + url + ": HTTP " + String(code));
         http.end();
         return false;
     }
 
-    // Temporärer Name im 8.3-Format (FAT ohne lange Namen): /sd/AUDIO/DL.TMP
+    // Temporärer Name im 8.3-Format (FAT ohne lange Namen)
     String tmp = String(AUDIO_DIR) + "/DL.TMP";
     if (!SD_MMC.exists(AUDIO_DIR)) {
         SD_MMC.mkdir(AUDIO_DIR);
@@ -110,7 +152,7 @@ static bool downloadFile(const char *url, const char *path) {
     SD_MMC.remove(tmp.c_str());
     File out = SD_MMC.open(tmp.c_str(), FILE_WRITE);
     if (!out) {
-        Serial.printf("download: konnte %s nicht schreiben\n", tmp.c_str());
+        logLine(String("download: konnte ") + tmp + " nicht schreiben");
         http.end();
         return false;
     }
@@ -140,15 +182,17 @@ static bool downloadFile(const char *url, const char *path) {
 
     if (expected >= 0 && total != expected) {
         SD_MMC.remove(tmp.c_str());
-        Serial.printf("download unvollständig: %d von %d Bytes\n", total, expected);
+        logLine(String("download unvollständig: ") + String(total) + " von " + String(expected) + " Bytes");
         return false;
     }
 
     SD_MMC.remove(path);
-    return SD_MMC.rename(tmp.c_str(), path);
+    bool ok = SD_MMC.rename(tmp.c_str(), path);
+    logLine(String("download ok: ") + path + " (" + String(total) + " Bytes)");
+    return ok;
 }
 
-// ---------- Audio: WAV-Wiedergabe ----------
+// ---------- Audio: WAV-Header ----------
 
 // Liest den Header bis zum data-Chunk. Gibt die Datenlänge zurück, 0 bei Fehler.
 static uint32_t wavDataStart(File &f) {
@@ -170,8 +214,8 @@ static uint32_t wavDataStart(File &f) {
             uint32_t rate = fmt[4] | (fmt[5] << 8) | (fmt[6] << 16) | ((uint32_t)fmt[7] << 24);
             uint16_t bits = fmt[14] | (fmt[15] << 8);
             if (format != 1 || channels != 1 || bits != 16 || rate != AUDIO_SAMPLE_RATE) {
-                Serial.printf("WAV-Format nicht unterstützt: fmt=%u ch=%u bits=%u rate=%lu\n",
-                              format, channels, bits, (unsigned long)rate);
+                logLine(String("WAV-Format nicht unterstützt: fmt=") + String(format) + " ch=" + String(channels)
+                        + " bits=" + String(bits) + " rate=" + String((unsigned long)rate));
                 return 0;
             }
             if (size > 16) {
@@ -189,6 +233,22 @@ static uint32_t wavDataStart(File &f) {
     return 0;
 }
 
+// ---------- Audioausgabe ----------
+
+#if AUDIO_BACKEND_PWM
+// Ein 16-Bit-Sample als 8-Bit-PWM ausgeben, mit fester Taktung (16 kHz)
+static void outputSamplesPwm(const uint8_t *buf, size_t bytes, uint32_t &nextUs) {
+    for (size_t i = 0; i + 1 < bytes; i += 2) {
+        int16_t s = (int16_t)(buf[i] | (buf[i + 1] << 8));
+        uint8_t v = (uint8_t)((s + 32768) >> 8);
+        ledcWrite(AUDIO_PWM_CHANNEL, v);
+        while ((int32_t)(micros() - nextUs) < 0) {
+        }
+        nextUs += 62;  // 1e6 / 16000 Hz, ergibt ca. 0,8 % Tempoabweichung
+    }
+}
+#endif
+
 // Spielt die Datei ab. Bricht bei stopRequested oder nach maxMs ab.
 static bool playWav(File &f, uint32_t maxMs) {
     uint32_t dataSize = wavDataStart(f);
@@ -199,6 +259,9 @@ static bool playWav(File &f, uint32_t maxMs) {
     static uint8_t buf[512];
     uint32_t remaining = dataSize;
     uint32_t start = millis();
+#if AUDIO_BACKEND_PWM
+    uint32_t nextUs = micros();
+#endif
 
     while (remaining > 0 && !stopRequested && (millis() - start) < maxMs) {
         size_t want = min<size_t>(remaining, sizeof(buf));
@@ -206,12 +269,18 @@ static bool playWav(File &f, uint32_t maxMs) {
         if (n <= 0) {
             break;
         }
+#if AUDIO_BACKEND_PWM
+        outputSamplesPwm(buf, n, nextUs);
+#else
         size_t written = 0;
         i2s_write(I2S_NUM_0, buf, n, &written, portMAX_DELAY);
+#endif
         remaining -= n;
     }
 
-    // Ausklingen lassen, damit der DMA-Puffer nicht abgeschnitten wird
+#if AUDIO_BACKEND_PWM
+    ledcWrite(AUDIO_PWM_CHANNEL, 128);  // Mittelstellung, kein Knacken am Ende
+#endif
     if (!stopRequested) {
         delay(50);
     }
@@ -271,7 +340,7 @@ finish:
 static void onMessage(char *topic, byte *payload, unsigned int length) {
     JsonDocument doc;
     if (deserializeJson(doc, payload, length)) {
-        Serial.printf("JSON ungültig auf %s\n", topic);
+        logLine(String("JSON ungültig auf ") + topic);
         return;
     }
 
@@ -329,12 +398,13 @@ static void onMessage(char *topic, byte *payload, unsigned int length) {
     busy = true;
     stopRequested = false;
     jobDeadline = millis() + job.maxMs;
-    xTaskCreatePinnedToCore(playTask, "play", 8192, copy, 1, NULL, 1);
+    // Kern 0: die Hauptschleife auf Kern 1 bleibt für MQTT frei
+    xTaskCreatePinnedToCore(playTask, "play", 8192, copy, 1, NULL, 0);
 }
 
 static void mqttConnect() {
     while (!mqtt.connected()) {
-        Serial.printf("MQTT verbinden mit %s:%d ...\n", MQTT_HOST, MQTT_PORT);
+        logLine(String("MQTT verbinden mit ") + MQTT_HOST + ":" + String(MQTT_PORT));
         bool ok = mqtt.connect(
             ELA_DEVICE_ID, MQTT_USER, MQTT_PASS,
             topicStatus.c_str(), 1, true, "{\"state\":\"offline\"}");
@@ -343,9 +413,9 @@ static void mqttConnect() {
             mqtt.subscribe(topicCmd.c_str(), 1);
             mqtt.subscribe(topicStop.c_str(), 1);
             mqtt.publish(topicStatus.c_str(), "{\"state\":\"online\"}", true);
-            Serial.println("MQTT verbunden");
+            logLine("MQTT verbunden");
         } else {
-            Serial.printf("MQTT-Fehler rc=%d, neuer Versuch in 3 s\n", mqtt.state());
+            logLine(String("MQTT-Fehler rc=") + String(mqtt.state()) + ", neuer Versuch in 3 s");
             delay(3000);
         }
     }
@@ -358,6 +428,9 @@ void setup() {
     delay(300);
     Serial.println("\n=== E-Raum-Controller ===");
 
+    logQueue = xQueueCreate(32, sizeof(String *));
+    ackQueue = xQueueCreate(16, sizeof(AckMsg));
+
     // Relais sofort aus, bevor sie als Ausgang geschaltet werden
     digitalWrite(RELAY1_PIN, RELAY_OFF);
     digitalWrite(RELAY2_PIN, RELAY_OFF);
@@ -369,13 +442,21 @@ void setup() {
         Serial.println("FEHLER: SD-Karte nicht erkannt");
     } else {
         Serial.printf("SD eingebunden, %llu MB\n", SD_MMC.totalBytes() / (1024ULL * 1024ULL));
-        String audioDir = String(AUDIO_DIR);
-        if (!SD_MMC.exists(audioDir.c_str())) {
-            SD_MMC.mkdir(audioDir.c_str());
+        // Ordnerstruktur nach docs/sd-karte.md
+        const char *dirs[] = {AUDIO_DIR, CONFIG_DIR, LOG_DIR};
+        for (const char *d : dirs) {
+            if (!SD_MMC.exists(d)) {
+                SD_MMC.mkdir(d);
+            }
         }
     }
 
-    // I²S für den PCM5102A
+#if AUDIO_BACKEND_PWM
+    // Test-Ausgabe: 8-Bit-PWM auf GPIO 4, Tiefpass (2,2 kΩ + 10 nF) davor
+    ledcSetup(AUDIO_PWM_CHANNEL, AUDIO_PWM_FREQ, 8);
+    ledcAttachPin(AUDIO_PWM_PIN, AUDIO_PWM_CHANNEL);
+    ledcWrite(AUDIO_PWM_CHANNEL, 128);
+#else
     i2s_config_t i2sConfig = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
         .sample_rate = AUDIO_SAMPLE_RATE,
@@ -398,6 +479,7 @@ void setup() {
     };
     i2s_driver_install(I2S_NUM_0, &i2sConfig, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &i2sPins);
+#endif
 
     // Ethernet mit den Standard-Pins des Olimex-Boards
     ETH.begin();
@@ -408,7 +490,7 @@ void setup() {
         Serial.print('.');
     }
     Serial.println();
-    Serial.printf("IP: %s\n", ETH.localIP().toString().c_str());
+    logLine(String("IP: ") + ETH.localIP().toString());
 
     String base = String("ela/") + ELA_DEVICE_ID;
     topicCmd = base + "/cmd";
@@ -416,11 +498,11 @@ void setup() {
     topicAck = base + "/ack";
     topicStatus = base + "/status";
 
-    ackQueue = xQueueCreate(16, sizeof(AckMsg));
-
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     mqtt.setBufferSize(512);
     mqtt.setCallback(onMessage);
+
+    logLine("Start, Audio-Ausgang: " AUDIO_BACKEND_NAME);
 }
 
 void loop() {
@@ -434,9 +516,14 @@ void loop() {
         publishAck(ack);
     }
 
+    // Log nur schreiben, wenn keine Wiedergabe auf die SD-Karte zugreift
+    if (!busy) {
+        flushLog();
+    }
+
     // Sicherheitsnetz: nach max_ms müssen die Relais aus sein, auch wenn die Task hängt
     if (busy && millis() > jobDeadline + WATCHDOG_MARGIN_MS) {
-        Serial.println("WATCHDOG: Relais werden freigegeben");
+        logLine("WATCHDOG: Relais werden freigegeben");
         setAllRelays(false);
         stopRequested = true;
     }
