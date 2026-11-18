@@ -64,3 +64,10 @@
 #define LOG_FILE "/LOG/ELA.LOG"
 #define LOG_OLD_FILE "/LOG/ELA_OLD.LOG"
 #define LOG_MAX_BYTES 65536       // ab dieser Größe wird ELA.LOG rotiert
+
+// Uhrzeit (NTP) und Aufräumen alter Ansagen
+#define NTP_SERVER "pool.ntp.org"           // braucht Internetzugang; sonst LAN-Zeitserver eintragen
+#define TZ_BERLIN "CET-1CEST,M3.5.0,M10.5.0/3"
+#define AUDIO_RETENTION_DAYS 30             // Ansagen, die so lange nicht gespielt wurden, werden gelöscht
+#define AUDIO_INDEX_FILE "/CONFIG/AUDIO.IDX"  // Zeitpunkt der letzten Wiedergabe je Ansage
+#define AUDIO_INDEX_TMP "/CONFIG/IDX.TMP"

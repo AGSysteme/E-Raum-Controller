@@ -7,6 +7,10 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <driver/i2s.h>
+#include <time.h>
+#include <map>
+#include <set>
+#include <vector>
 #include "config.h"
 
 // ---------------------------------------------------------------
@@ -90,6 +94,133 @@ static void flushLog() {
     while (xQueueReceive(logQueue, &msg, 0) == pdTRUE) {
         writeLogLine(*msg);
         delete msg;
+    }
+}
+
+// ---------- Aufräumen alter Ansagen ----------
+// CONFIG/AUDIO.IDX: Zeile "NNNN <unix>" = Zeitpunkt der letzten Wiedergabe der Ansage NNNN.
+
+static bool timeValid() {
+    return time(nullptr) > 1700000000;  // NTP-Zeit gesetzt (nach 2023)
+}
+
+static void loadAudioIndex(std::map<uint32_t, uint32_t> &idx) {
+    idx.clear();
+    File f = SD_MMC.open(AUDIO_INDEX_FILE, FILE_READ);
+    if (!f) {
+        return;
+    }
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        int sp = line.indexOf(' ');
+        if (sp <= 0) {
+            continue;
+        }
+        uint32_t id = line.substring(0, sp).toInt();
+        uint32_t ts = line.substring(sp + 1).toInt();
+        if (id > 0) {
+            idx[id] = ts;
+        }
+    }
+    f.close();
+}
+
+static void saveAudioIndex(const std::map<uint32_t, uint32_t> &idx) {
+    SD_MMC.remove(AUDIO_INDEX_TMP);
+    File f = SD_MMC.open(AUDIO_INDEX_TMP, FILE_WRITE);
+    if (!f) {
+        logLine("Index konnte nicht geschrieben werden");
+        return;
+    }
+    for (const auto &e : idx) {
+        f.printf("%04u %lu\n", (unsigned)e.first, (unsigned long)e.second);
+    }
+    f.close();
+    SD_MMC.remove(AUDIO_INDEX_FILE);
+    SD_MMC.rename(AUDIO_INDEX_TMP, AUDIO_INDEX_FILE);
+}
+
+// Merkt sich die Wiedergabe. Schreibt höchstens einmal pro Tag je Ansage.
+static void touchAudioIndex(uint32_t id) {
+    if (!timeValid()) {
+        return;
+    }
+    std::map<uint32_t, uint32_t> idx;
+    loadAudioIndex(idx);
+
+    uint32_t now = (uint32_t)time(nullptr);
+    auto it = idx.find(id);
+    if (it != idx.end() && now - it->second < 86400UL) {
+        return;
+    }
+    idx[id] = now;
+    saveAudioIndex(idx);
+}
+
+static void cleanupOldAudio() {
+    std::map<uint32_t, uint32_t> idx;
+    loadAudioIndex(idx);
+    uint32_t now = (uint32_t)time(nullptr);
+    bool changed = false;
+
+    // Dateien einsammeln (Löschen erst nach dem Durchlauf des Verzeichnisses)
+    std::vector<String> names;
+    std::set<uint32_t> present;
+    File dir = SD_MMC.open(AUDIO_DIR);
+    if (!dir || !dir.isDirectory()) {
+        return;
+    }
+    for (File e = dir.openNextFile(); e; e = dir.openNextFile()) {
+        String name = String(e.name());
+        bool isDir = e.isDirectory();
+        e.close();
+        name = name.substring(name.lastIndexOf('/') + 1);
+        if (isDir || name.length() != 8 || !name.endsWith(".WAV")) {
+            continue;
+        }
+        uint32_t id = name.substring(0, 4).toInt();
+        if (id == 0) {
+            continue;
+        }
+        present.insert(id);
+        names.push_back(name);
+    }
+    dir.close();
+
+    for (const String &name : names) {
+        uint32_t id = name.substring(0, 4).toInt();
+        auto it = idx.find(id);
+        if (it == idx.end()) {
+            // Neu gesehen: Frist beginnt jetzt
+            idx[id] = now;
+            changed = true;
+            continue;
+        }
+        if (now - it->second > AUDIO_RETENTION_DAYS * 86400UL) {
+            String path = String(AUDIO_DIR) + "/" + name;
+            if (SD_MMC.remove(path.c_str())) {
+                logLine("Aufgeräumt: " + path + " (" + String(AUDIO_RETENTION_DAYS) + " Tage nicht genutzt)");
+            } else {
+                logLine("Löschen fehlgeschlagen: " + path);
+                continue;
+            }
+            idx.erase(id);
+            changed = true;
+        }
+    }
+
+    // Einträge zu Dateien, die es nicht mehr gibt, entfernen
+    for (auto it = idx.begin(); it != idx.end();) {
+        if (present.count(it->first) == 0) {
+            it = idx.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+
+    if (changed) {
+        saveAudioIndex(idx);
     }
 }
 
@@ -312,6 +443,8 @@ static void playTask(void *param) {
             goto finish;
         }
 
+        touchAudioIndex(job->audio);
+
         for (int i = 0; i < RELAY_COUNT; i++) {
             setRelay(i + 1, job->relayOn[i]);
         }
@@ -511,6 +644,13 @@ void setup() {
     logLine(String("IP: ") + ETH.localIP().toString());
     setupHttp();
 
+    // Uhrzeit per NTP, Zeitzone Berlin. Ohne Uhrzeit wird nicht aufgeräumt.
+    configTzTime(TZ_BERLIN, NTP_SERVER);
+    for (int i = 0; i < 20 && !timeValid(); i++) {
+        delay(500);
+    }
+    logLine(timeValid() ? "Uhrzeit per NTP gesetzt" : "Uhrzeit nicht gesetzt: Aufräumen aus");
+
     String base = String("ela/") + ELA_DEVICE_ID;
     topicCmd = base + "/cmd";
     topicStop = base + "/stop";
@@ -556,6 +696,16 @@ void loop() {
     AckMsg ack;
     while (xQueueReceive(ackQueue, &ack, 0) == pdTRUE) {
         publishAck(ack);
+    }
+
+    // Einmal täglich alte Ansagen löschen, nur wenn keine Ansage läuft
+    static uint32_t lastCleanup = 0;
+    if (!busy && timeValid()) {
+        uint32_t nowS = (uint32_t)time(nullptr);
+        if (lastCleanup == 0 || nowS - lastCleanup >= 86400UL) {
+            cleanupOldAudio();
+            lastCleanup = nowS;
+        }
     }
 
     // Log nur schreiben, wenn keine Wiedergabe auf die SD-Karte zugreift
