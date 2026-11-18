@@ -446,8 +446,23 @@ void setup() {
         const char *dirs[] = {AUDIO_DIR, CONFIG_DIR, LOG_DIR};
         for (const char *d : dirs) {
             if (!SD_MMC.exists(d)) {
-                SD_MMC.mkdir(d);
+                bool made = SD_MMC.mkdir(d);
+                Serial.printf("Ordner %s angelegt: %s\n", d, made ? "ja" : "NEIN");
+            } else {
+                Serial.printf("Ordner %s vorhanden\n", d);
             }
+        }
+        // Prüfung: Ordner-Inhalt und Logdatei-Größe ausgeben
+        File audio = SD_MMC.open(AUDIO_DIR);
+        for (File e = audio.openNextFile(); e; e = audio.openNextFile()) {
+            Serial.printf("  %s/%s (%u Bytes)\n", AUDIO_DIR, e.name(), (unsigned)e.size());
+        }
+        audio.close();
+        File logf = SD_MMC.open(LOG_FILE, FILE_READ);
+        Serial.printf("Logdatei %s: %s\n", LOG_FILE, logf ? "vorhanden" : "fehlt (wird beim ersten Eintrag angelegt)");
+        if (logf) {
+            Serial.printf("  Größe: %u Bytes\n", (unsigned)logf.size());
+            logf.close();
         }
     }
 
